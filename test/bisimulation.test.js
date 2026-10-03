@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const { audit, weakTargets, normalize, TAU } = require('../src/bisimulation');
+const { audit, weakTargets, normalize, buildChallengePath, TAU } = require('../src/bisimulation');
 const { samples } = require('../src/samples');
 
 test('仅以 tau 环重命名而等价：关系包含两个初始状态对', () => {
@@ -65,8 +65,115 @@ test('多轮级联：初始对第 2 轮淘汰，失败义务只引用第 1 轮�
   }
 });
 
-test('tau 链上的弱转移：静默前缀后承接动作', () => {
+// 校验挑战路径：从 origin 连续到 target，每步是真实迁移、上一步落点即下一步起点，
+// 静默前缀全部为 tau，最后一步为可观察动作。
+function assertContinuousPath(proc, path, origin, action, target) {
+  assert.ok(Array.isArray(path) && path.length > 0, '挑战路径必须非空');
+  const byId = new Map(proc.transitions.map((e) => [e.id, e]));
+  assert.equal(path[0].from, origin, '路径必须从实际挑战状态出发');
+  assert.equal(path[path.length - 1].to, target, '路径必须连续到达挑战落点');
+  for (let i = 0; i < path.length; i += 1) {
+    const step = path[i];
+    assert.notEqual(step.id, null, '每一步都必须对应录入的迁移标识');
+    const real = byId.get(step.id);
+    assert.ok(real, `迁移标识必须真实存在：${step.id}`);
+    assert.equal(step.from, real.from);
+    assert.equal(step.action, real.action);
+    assert.equal(step.to, real.to);
+    if (i > 0) assert.equal(step.from, path[i - 1].to, '前后步骤必须衔接');
+    if (i < path.length - 1) assert.equal(step.action, TAU, '可观察动作前只能有静默前缀');
+  }
+  assert.equal(path[path.length - 1].action, action, '最后一步必须是挑战动作');
+}
+
+test('汇合场景：初始对第 2 轮淘汰，x 挑战路径从初态连续回放且不引用不连通迁移', () => {
+  const { procA, procB } = samples.confluence;
+  const r = audit(procA, procB);
+  assert.equal(r.ok, true);
+  assert.equal(r.equivalent, false, '审计结论仍为不等价');
+
+  const init = r.eliminatedPairs.find((p) => p.pair[0] === 'a0' && p.pair[1] === 'b0');
+  assert.ok(init, '初始状态对应被淘汰');
+  assert.equal(init.round, 2, '初始对在后续（第 2）轮淘汰');
+  assert.equal(init.action, 'x');
+  assert.equal(init.challenger, 'A');
+
+  const fail = init.transitions.find((t) => t.source === 'a2');
+  assert.equal(fail.reason, 'ALL_RESPONSES_ELIMINATED');
+  assert.equal(fail.responses.length, 1);
+  assert.deepEqual(fail.responses[0].pair, ['a2', 'b1']);
+  assert.equal(fail.responses[0].eliminatedRound, 1, '依据仅引用第 1 轮淘汰结果');
+
+  // 核心回归：挑战路径必须是 a0 --tau/a-tau--> a1 --x/a-x-relay--> a2，
+  // 绝不能引用从 a0 不可达的 ad 上标识更靠前的 a-x-direct。
+  assertContinuousPath(normalize(procA), fail.challengePath, 'a0', 'x', 'a2');
+  assert.deepEqual(fail.challengePath.map((s) => s.id), ['a-tau', 'a-x-relay']);
+  assert.ok(!fail.challengePath.some((s) => s.id === 'a-x-direct' || s.from === 'ad'));
+
+  // 首个淘汰状态对的展示路径同样必须从其挑战状态连续到达
+  const A = normalize(procA);
+  for (const ep of r.eliminatedPairs) {
+    for (const t of ep.transitions) {
+      const origin = ep.challenger === 'A' ? ep.pair[0] : ep.pair[1];
+      const proc = ep.challenger === 'A' ? A : normalize(procB);
+      assertContinuousPath(proc, t.challengePath, origin, ep.action, t.source);
+      assert.ok(!t.challengePath.some((s) => s.from === 'ad' && ep.pair[0] !== 'ad'),
+        '非 ad 的挑战状态不得引用不连通状态 ad 上的迁移');
+    }
+  }
+});
+
+test('挑战路径构造器：可达性约束、汇合选择与稳定排序', () => {
   const proc = normalize({
+    states: [{ name: 's' }, { name: 'u' }, { name: 'm1' }, { name: 'm2' }, { name: 'p' }, { name: 'd' }],
+    initial: 's',
+    transitions: [
+      { id: 'tau-long', from: 's', action: 'tau', to: 'm1' },
+      { id: 'tau-m1-u', from: 'm1', action: 'tau', to: 'u' },
+      { id: 'tau-short', from: 's', action: 'tau', to: 'u' }, // 另一条更短的静默前缀（id 反而更大）
+      { id: 'tau-loop', from: 'u', action: 'tau', to: 'u' }, // 静默环绕行步数更多，不应更优
+      { id: 'x-via-u', from: 'u', action: 'x', to: 'p' },
+      { id: 'a-x-disconnected', from: 'd', action: 'x', to: 'p' }, // 与 s 不连通但 id 最靠前
+    ],
+  });
+
+  const path = buildChallengePath(proc, 's', 'x', 'p');
+  assertContinuousPath(proc, path, 's', 'x', 'p');
+  // 多条静默前缀汇合到同一可观察边：取步数最少者（tau-short，1 步）而非
+  // id 更小但多 1 步的 tau-long→tau-m1-u；且忽略不连通的 a-x-disconnected。
+  assert.deepEqual(path.map((e) => e.id), ['tau-short', 'x-via-u']);
+
+  // 重复构造结果稳定
+  assert.deepEqual(buildChallengePath(proc, 's', 'x', 'p').map((e) => e.id), ['tau-short', 'x-via-u']);
+
+  // 0 条静默前缀：s ==tau=> s 为空路径
+  assert.deepEqual(buildChallengePath(proc, 's', 'tau', 's'), []);
+  // 非零静默路径也按标识稳定
+  assert.deepEqual(buildChallengePath(proc, 's', 'tau', 'u').map((e) => e.id), ['tau-short']);
+  assert.deepEqual(buildChallengePath(proc, 's', 'tau', 'm1').map((e) => e.id), ['tau-long']);
+
+  // 直接动作（无静默前缀）：一步到位
+  const direct = normalize({
+    states: [{ name: 'q' }, { name: 'r' }],
+    initial: 'q',
+    transitions: [{ id: 'qx', from: 'q', action: 'x', to: 'r' }],
+  });
+  assert.deepEqual(buildChallengePath(direct, 'q', 'x', 'r').map((e) => e.id), ['qx']);
+
+  // 等长静默前缀：按迁移标识序列字典序稳定取最小
+  const tied = normalize({
+    states: [{ name: 's' }, { name: 'u' }, { name: 'p' }],
+    initial: 's',
+    transitions: [
+      { id: 'z-tau', from: 's', action: 'tau', to: 'u' },
+      { id: 'a-tau', from: 's', action: 'tau', to: 'u' },
+      { id: 'x1', from: 'u', action: 'x', to: 'p' },
+    ],
+  });
+  assert.deepEqual(buildChallengePath(tied, 's', 'x', 'p').map((e) => e.id), ['a-tau', 'x1']);
+});
+
+test('tau 链上的弱转移：静默前缀后承接动作', () => {  const proc = normalize({
     states: [{ name: 's' }, { name: 'u' }, { name: 'p' }, { name: 'v' }],
     initial: 's',
     transitions: [

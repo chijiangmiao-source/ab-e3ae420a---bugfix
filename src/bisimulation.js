@@ -137,13 +137,100 @@ function weakTargets(proc, src, action) {
   return result;
 }
 
-function compactChallengePath(proc, origin, action, target) {
-  const sameTarget = proc.transitions.filter((t) => t.action === action && t.to === target);
-  if (sameTarget.length) {
-    const edge = sameTarget[0];
-    return [{ id: edge.id, from: edge.from, action: edge.action, to: edge.to }];
+// ---------- 连续挑战路径 ----------
+//
+// 展示弱转移 origin ==a==> target 时，路径必须从实际挑战状态 origin 连续回放：
+// 先经静默前缀（0 条或多条 tau）到达承接状态 u，再由 u 以一条可观察迁移到 target；
+// 每一步都必须是录入的迁移标识，且上一步落点即下一步起点。绝不允许引用从 origin
+// 不可达状态发出的同动作迁移（例如与初态不连通的状态上、id 排序更靠前的同动作边）。
+//
+// 存在多个有效静默前缀或汇合路径时，优先取步数最少的连续路径（最短静默前缀），
+// 步数相同再按整条路径的迁移标识序列字典序取最小（序列为另一序列真前缀时较短者
+// 更小），保证展示顺序稳定可复算。
+
+const pathCache = new WeakMap(); // proc -> Map(origin -> Map(state -> 最优 tau 前缀边序列))
+
+function compareEdgeLabels(p, q) {
+  const n = Math.min(p.length, q.length);
+  for (let i = 0; i < n; i += 1) {
+    if (p[i].id < q[i].id) return -1;
+    if (p[i].id > q[i].id) return 1;
   }
-  return [{ id: null, from: origin, action, to: target }];
+  return p.length - q.length;
+}
+
+// 路径全序：步数少者优先；步数相同按迁移标识序列字典序。
+function comparePaths(p, q) {
+  if (p.length !== q.length) return p.length - q.length;
+  return compareEdgeLabels(p, q);
+}
+
+// 求 origin 经 tau 到每个静默可达状态的最优（步数最少、标识序列最小）迁移序列。
+// 按该全序取最小的 Dijkstra：每条边权 1 且扩展标签为原标签真前缀，状态首次以
+// 最优标签出队即全局最优；tau 环的绕行步数更多，不可能更优。
+function tauPathsFrom(proc, origin) {
+  let byOrigin = pathCache.get(proc);
+  if (!byOrigin) {
+    byOrigin = new Map();
+    pathCache.set(proc, byOrigin);
+  }
+  const cached = byOrigin.get(origin);
+  if (cached) return cached;
+
+  const best = new Map([[origin, []]]);
+  const queued = [{ state: origin, path: [] }];
+  while (queued.length) {
+    let idx = 0;
+    for (let i = 1; i < queued.length; i += 1) {
+      if (comparePaths(queued[i].path, queued[idx].path) < 0) idx = i;
+    }
+    const { state, path } = queued.splice(idx, 1)[0];
+    const known = best.get(state);
+    if (known !== undefined && comparePaths(known, path) < 0) continue;
+
+    for (const edge of proc.transitions) {
+      if (edge.from !== state || edge.action !== TAU) continue;
+      const candidate = [...path, edge];
+      const cur = best.get(edge.to);
+      if (cur === undefined || comparePaths(candidate, cur) < 0) {
+        best.set(edge.to, candidate);
+        queued.push({ state: edge.to, path: candidate });
+      }
+    }
+  }
+
+  byOrigin.set(origin, best);
+  return best;
+}
+
+function edgeStep(edge) {
+  return { id: edge.id, from: edge.from, action: edge.action, to: edge.to };
+}
+
+// 构造从 origin 连续到 target 的挑战路径；target 必须确为该动作的弱转移落点。
+// 可观察动作：在 origin 的静默可达状态中，选择完整路径（tau 前缀 + 承接边）
+// 步数最少、标识序列最小者。tau 动作：直接取 origin 到 target 的最优 tau 路径
+// （0 步时为空序列）。
+function buildChallengePath(proc, origin, action, target) {
+  const prefixes = tauPathsFrom(proc, origin);
+
+  if (action === TAU) {
+    const prefix = prefixes.get(target);
+    return prefix === undefined ? null : prefix.map(edgeStep);
+  }
+
+  let chosen = null;
+  for (const [u, prefix] of prefixes) {
+    for (const edge of proc.transitions) {
+      if (edge.from !== u || edge.action !== action || edge.to !== target) continue;
+      const candidate = [...prefix, edge];
+      if (chosen === null || comparePaths(candidate, chosen.full) < 0) {
+        chosen = { full: candidate };
+      }
+    }
+  }
+  if (!chosen) return null; // 不应发生：target 必由某条弱转移到达
+  return chosen.full.map(edgeStep);
 }
 
 // ---------- 按轮次淘汰 ----------
@@ -236,7 +323,7 @@ function audit(specA, specB) {
           for (const src of d.sources) {
             failedTransitions.push({
               source: src,
-              challengePath: compactChallengePath(challengerProc, d.origin, d.action, src),
+              challengePath: buildChallengePath(challengerProc, d.origin, d.action, src),
               reason: 'NO_MATCHING_ACTION',
               responses: [],
             });
@@ -259,7 +346,7 @@ function audit(specA, specB) {
               responses.sort((u, v) => v.eliminatedRound - u.eliminatedRound || cmpPair(u.pair, v.pair));
               failedTransitions.push({
                 source: src,
-                challengePath: compactChallengePath(challengerProc, d.origin, d.action, src),
+                challengePath: buildChallengePath(challengerProc, d.origin, d.action, src),
                 reason: 'ALL_RESPONSES_ELIMINATED',
                 responses,
               });
@@ -335,5 +422,6 @@ module.exports = {
   normalize,
   epsilonClosure,
   weakTargets,
+  buildChallengePath,
   audit,
 };

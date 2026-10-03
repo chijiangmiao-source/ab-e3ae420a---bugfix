@@ -7,6 +7,8 @@
 //   3) 接口 / HTTP 冒烟：健康路径、页面、审计接口
 //      - 静默环等价规程：审计必须判定等价，关系含两个初始状态对
 //      - 缺失匹配动作规程：审计必须判定不等价，且失败依据只引用更早轮次
+//      - 汇合场景：初始对第 2 轮淘汰，挑战路径从实际挑战状态连续到达目标，
+//        不引用与初态不连通的同动作迁移
 //      - 无效输入：一次返回全部问题并清除旧结论
 // 完成后退出：全部通过 0，任一失败 1。
 
@@ -149,6 +151,72 @@ async function postAudit(body) {
         }
       }
     }
+  });
+
+  await astep('汇合场景：初始对第 2 轮淘汰，x 挑战路径连续回放且不引用不连通迁移', async () => {
+    const j = await postAudit(samples.confluence);
+    assert.equal(j.ok, true);
+    assert.equal(j.equivalent, false, '结论必须仍为不等价');
+
+    // 初始状态对的淘汰轮次
+    const init = j.eliminatedPairs.find((p) => p.pair[0] === 'a0' && p.pair[1] === 'b0');
+    assert.ok(init, '初始状态对应被淘汰');
+    assert.equal(init.round, 2, '初始对应在第 2 轮淘汰');
+    assert.equal(init.action, 'x');
+    assert.equal(init.challenger, 'A');
+
+    const fail = init.transitions.find((t) => t.source === 'a2');
+    assert.equal(fail.reason, 'ALL_RESPONSES_ELIMINATED');
+    assert.equal(fail.responses.length, 1);
+    assert.deepEqual(fail.responses[0].pair, ['a2', 'b1']);
+    assert.equal(fail.responses[0].eliminatedRound, 1);
+
+    // 挑战路径必须从实际挑战状态 a0 出发连续到达 a2：a0 --tau/a-tau--> a1 --x/a-x-relay--> a2
+    const path = fail.challengePath;
+    assert.ok(Array.isArray(path) && path.length === 2, '路径应包含静默前缀与可观察两步');
+    assert.equal(path[0].id, 'a-tau');
+    assert.equal(path[0].from, 'a0');
+    assert.equal(path[0].action, 'tau');
+    assert.equal(path[0].to, 'a1');
+    assert.equal(path[1].id, 'a-x-relay');
+    assert.equal(path[1].from, 'a1');
+    assert.equal(path[1].action, 'x');
+    assert.equal(path[1].to, 'a2');
+    // 绝不引用从 a0 不连通的 ad 上 id 排序更靠前的直接迁移
+    assert.ok(!path.some((s) => s.id === 'a-x-direct' || s.from === 'ad'),
+      '不得引用不连通状态上的同动作迁移');
+
+    // 首个淘汰状态对的全部展示路径同样连续可达（审查员可据此复算淘汰过程）
+    const f = j.firstEliminated;
+    for (const t of f.transitions) {
+      const p = t.challengePath;
+      assert.ok(Array.isArray(p) && p.length > 0);
+      const origin = f.challenger === 'A' ? f.pair[0] : f.pair[1];
+      assert.equal(p[0].from, origin, '首个淘汰对的路径必须从其挑战状态出发');
+      for (let i = 1; i < p.length; i += 1) {
+        assert.equal(p[i].from, p[i - 1].to, '路径前后必须连续衔接');
+      }
+      assert.ok(p.every((s) => s.id), '每一步都必须携带录入的迁移标识');
+      const proc = f.challenger === 'A' ? samples.confluence.procA : samples.confluence.procB;
+      const ids = new Set(proc.transitions.map((tr) => tr.id));
+      assert.ok(p.every((s) => ids.has(s.id)), '路径标识必须真实存在');
+    }
+  });
+
+  await astep('汇合场景：多轮依据仍按轮次递减，且等价裁决不回归', async () => {
+    const j = await postAudit(samples.confluence);
+    for (const ep of j.eliminatedPairs) {
+      for (const t of ep.transitions) {
+        if (t.reason === 'ALL_RESPONSES_ELIMINATED') {
+          for (const w of t.responses) {
+            assert.ok(Number.isInteger(w.eliminatedRound) && w.eliminatedRound < ep.round);
+          }
+        }
+      }
+    }
+    // 静默环等价裁决保持不变
+    const eq = await postAudit(samples.equivalent);
+    assert.equal(eq.equivalent, true);
   });
 
   await astep('无效输入：一次返回全部问题并清除旧结论', async () => {
