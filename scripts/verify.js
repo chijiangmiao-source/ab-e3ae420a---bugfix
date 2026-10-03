@@ -7,6 +7,8 @@
 //   3) 接口 / HTTP 冒烟：健康路径、页面、审计接口
 //      - 静默环等价规程：审计必须判定等价，关系含两个初始状态对
 //      - 缺失匹配动作规程：审计必须判定不等价，且失败依据只引用更早轮次
+//      - 不连通汇合规程：初始对第 2 轮淘汰，x 挑战路径必须从实际挑战状态连续到达
+//        目标，逐步引用录入迁移标识，且不得引用不连通状态上标识更靠前的同动作迁移
 //      - 无效输入：一次返回全部问题并清除旧结论
 // 完成后退出：全部通过 0，任一失败 1。
 
@@ -149,6 +151,47 @@ async function postAudit(body) {
         }
       }
     }
+  });
+
+  await astep('不连通汇合规程：初始对第 2 轮淘汰，x 挑战路径连续回放且不引用不连通迁移', async () => {
+    const j = await postAudit(samples.converge);
+    assert.equal(j.ok, true);
+    assert.equal(j.equivalent, false);
+    const init = j.eliminatedPairs.find((p) => p.pair[0] === 'a0' && p.pair[1] === 'b0');
+    assert.ok(init, '应给出初始状态对的淘汰记录');
+    assert.equal(init.round, 2, '初始对应在第 2 轮淘汰');
+    assert.equal(init.action, 'x');
+    assert.equal(init.challenger, 'A');
+    assert.equal(j.initialAlive[0], false);
+
+    const fail = init.transitions.find((t) => t.source === 'a2');
+    assert.ok(fail, '初始对的 x 挑战应给出到 a2 的失败义务');
+    assert.equal(fail.reason, 'ALL_RESPONSES_ELIMINATED');
+
+    // 挑战路径必须从实际挑战状态 a0 连续到达 a2：逐步衔接、每步引用录入迁移标识
+    const path = fail.challengePath;
+    const byId = new Map(samples.converge.procA.transitions.map((t) => [t.id, t]));
+    let cur = 'a0';
+    for (const step of path) {
+      assert.ok(step && typeof step.id === 'string' && byId.has(step.id), `路径每步须引用录入的迁移标识：${JSON.stringify(step)}`);
+      const edge = byId.get(step.id);
+      assert.equal(step.from, edge.from);
+      assert.equal(step.to, edge.to);
+      assert.equal(step.action, edge.action);
+      assert.equal(step.from, cur, '静默前缀/动作必须逐步衔接');
+      cur = step.to;
+    }
+    assert.equal(cur, 'a2', '挑战路径终点必须是挑战落点');
+    for (const step of path.slice(0, -1)) assert.equal(step.action, 'tau', '可观察动作之前只能有静默前缀');
+    assert.equal(path[path.length - 1].action, 'x');
+
+    // 期望路径：a0 --tau/t-tau--> am --x/t-x-relay--> a2
+    assert.deepEqual(path.map((s) => s.id), ['t-tau', 't-x-relay']);
+    // 关键回归：绝不引用与初态不连通、但标识排序更靠前的同动作迁移 aaa-direct
+    assert.ok(!path.some((s) => s.id === 'aaa-direct'), '不得引用不连通状态 ad 上的直接 x 迁移');
+
+    // 多轮递减依据仍保持
+    assert.ok(fail.responses.every((w) => Number.isInteger(w.eliminatedRound) && w.eliminatedRound < init.round));
   });
 
   await astep('无效输入：一次返回全部问题并清除旧结论', async () => {

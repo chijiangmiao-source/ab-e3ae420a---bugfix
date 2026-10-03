@@ -58,6 +58,7 @@
       <option value="equivalent">tau 自环 + 重命名（应等价）</option>
       <option value="missing">缺失匹配动作（应不等价）</option>
       <option value="cascade">多轮级联淘汰（初始对第 2 轮失败）</option>
+      <option value="converge">不连通汇合路径（挑战路径须连续回放）</option>
     </select>
     <button class="ghost" id="loadBtn">载入</button>
     <span style="flex:1"></span>
@@ -158,9 +159,12 @@ function renderFirst(r) {
 
 function renderTransitions(f) {
   const rows = f.transitions.map((t) => {
-    const path = (t.challengePath || []).map((step) => step.id
-      ? `${esc(step.from)} --${esc(step.action)} / ${esc(step.id)}--&gt; ${esc(step.to)}`
-      : `${esc(step.from)} --${esc(step.action)}--&gt; ${esc(step.to)}`).join('<br>');
+    const steps = t.challengePath || [];
+    const path = steps.length
+      ? steps.map((step) => step.id
+        ? `${esc(step.from)} --${esc(step.action)} / ${esc(step.id)}--&gt; ${esc(step.to)}`
+        : `${esc(step.from)} --${esc(step.action)}--&gt; ${esc(step.to)}`).join('<br>')
+      : '<span class="muted">零步静默前缀（挑战状态本身即为落点）</span>';
     let detail;
     if (t.reason === 'NO_MATCHING_ACTION') {
       detail = '<span class="muted">应答侧无该动作的任何（弱）转移可承接</span>';

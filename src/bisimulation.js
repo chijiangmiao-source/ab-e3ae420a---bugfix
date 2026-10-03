@@ -92,16 +92,23 @@ function normalize(spec) {
   const stateSet = new Set(names);
   const actions = new Set();
   const out = new Map(names.map((n) => [n, new Map()]));
-  const transitions = [];
+  const valid = [];
   for (const t of spec.transitions) {
     if (!stateSet.has(t.from) || !stateSet.has(t.to) || typeof t.action !== 'string' || !t.action) continue;
     actions.add(t.action);
+    valid.push({ id: t.id, from: t.from, action: t.action, to: t.to });
+  }
+  // 迁移统一按标识排序：所有路径枚举均以此为稳定次序
+  valid.sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+  const transitions = [];
+  const tauOut = new Map(names.map((n) => [n, []]));
+  for (const t of valid) {
     if (!out.get(t.from).has(t.action)) out.get(t.from).set(t.action, new Set());
     out.get(t.from).get(t.action).add(t.to);
-    transitions.push({ id: t.id, from: t.from, action: t.action, to: t.to });
+    if (t.action === TAU) tauOut.get(t.from).push(t); // valid 已按 id 排序
+    transitions.push(t);
   }
-  transitions.sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
-  return { names, stateSet, actions, out, transitions, initial: spec.initial };
+  return { names, stateSet, actions, out, tauOut, transitions, initial: spec.initial };
 }
 
 // ---------- 弱转移 ----------
@@ -137,13 +144,87 @@ function weakTargets(proc, src, action) {
   return result;
 }
 
-function compactChallengePath(proc, origin, action, target) {
-  const sameTarget = proc.transitions.filter((t) => t.action === action && t.to === target);
-  if (sameTarget.length) {
-    const edge = sameTarget[0];
-    return [{ id: edge.id, from: edge.from, action: edge.action, to: edge.to }];
+// 挑战路径：必须从被审计的实际挑战状态连续回放——
+// 静默前缀（0 条或多条 tau，每步引用录入的迁移标识）+ 可观察动作迁移，逐步衔接至目标。
+// 路径选择稳定：按迁移标识升序枚举候选（valid 迁移已按 id 排序），
+// 故存在多个有效静默前缀或汇合路径时展示顺序确定，且不会引用从挑战状态不可达的同动作迁移。
+function challengePath(proc, origin, action, target) {
+  if (action === TAU) {
+    const path = shortestTauPath(proc, origin, target);
+    // 可达即连续路径（origin===target 时为零步静默前缀）；不可达不应发生，给占位以便排查
+    return path !== null ? path : [{ id: null, from: origin, action: TAU, to: target }];
+  }
+  // 在 origin 的 epsilon 闭包（经静默前缀可达）内寻找承接状态 u：
+  // 闭包按到达路径长短分层、同层按状态名稳定排序，使静默前缀选择确定。
+  for (const u of closureLayers(proc, origin)) {
+    for (const edgeId of sortedEdgeIds(proc, u, action, target)) {
+      return [...shortestTauPath(proc, origin, u), { id: edgeId, from: u, action, to: target }];
+    }
   }
   return [{ id: null, from: origin, action, to: target }];
+}
+
+// 按迁移标识升序返回 u --action--> target 的迁移标识
+function sortedEdgeIds(proc, u, action, target) {
+  return proc.transitions
+    .filter((t) => t.from === u && t.action === action && t.to === target)
+    .map((t) => t.id);
+}
+
+// BFS 枚举 epsilon 闭包：先短路径后长路径；同一深度按状态名排序
+function closureLayers(proc, src) {
+  const seen = new Set([src]);
+  const layers = [[src]];
+  let frontier = [src];
+  while (frontier.length) {
+    const next = new Set();
+    for (const u of frontier) {
+      for (const t of proc.tauOut.get(u)) {
+        if (!seen.has(t.to)) {
+          seen.add(t.to);
+          next.add(t.to);
+        }
+      }
+    }
+    if (!next.size) break;
+    const layer = [...next].sort();
+    layers.push(layer);
+    frontier = layer;
+  }
+  return layers.flat();
+}
+
+// BFS 求 origin 到 goal 的最短 tau 路径；前驱状态按名称、同深度迁移按标识升序展开，路径确定
+function shortestTauPath(proc, origin, goal) {
+  if (origin === goal) return [];
+  const prev = new Map([[origin, null]]);
+  let frontier = [origin];
+  while (frontier.length) {
+    frontier.sort();
+    const next = new Map(); // toState -> 选取的前驱迁移（按展开次序首次到达）
+    for (const u of frontier) {
+      for (const t of proc.tauOut.get(u)) {
+        if (!prev.has(t.to) && !next.has(t.to)) next.set(t.to, t);
+      }
+    }
+    if (!next.size) break;
+    for (const [v, t] of next) {
+      prev.set(v, t);
+      if (v === goal) {
+        const steps = [];
+        let cur = goal;
+        while (cur !== origin) {
+          const edge = prev.get(cur);
+          steps.push({ id: edge.id, from: edge.from, action: TAU, to: edge.to });
+          cur = edge.from;
+        }
+        steps.reverse();
+        return steps;
+      }
+    }
+    frontier = [...next.keys()];
+  }
+  return null; // 不可达
 }
 
 // ---------- 按轮次淘汰 ----------
@@ -236,7 +317,7 @@ function audit(specA, specB) {
           for (const src of d.sources) {
             failedTransitions.push({
               source: src,
-              challengePath: compactChallengePath(challengerProc, d.origin, d.action, src),
+              challengePath: challengePath(challengerProc, d.origin, d.action, src),
               reason: 'NO_MATCHING_ACTION',
               responses: [],
             });
@@ -259,7 +340,7 @@ function audit(specA, specB) {
               responses.sort((u, v) => v.eliminatedRound - u.eliminatedRound || cmpPair(u.pair, v.pair));
               failedTransitions.push({
                 source: src,
-                challengePath: compactChallengePath(challengerProc, d.origin, d.action, src),
+                challengePath: challengePath(challengerProc, d.origin, d.action, src),
                 reason: 'ALL_RESPONSES_ELIMINATED',
                 responses,
               });

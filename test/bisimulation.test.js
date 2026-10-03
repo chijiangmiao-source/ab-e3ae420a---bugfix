@@ -65,6 +65,105 @@ test('多轮级联：初始对第 2 轮淘汰，失败义务只引用第 1 轮�
   }
 });
 
+// 校验一条挑战路径：从 origin 连续回放——每步引用录入的迁移标识、逐步衔接、终点为 target
+function assertContinuousPath(proc, path, origin, action, target) {
+  assert.ok(Array.isArray(path) && path.length >= 1, '挑战路径至少含一步');
+  const byId = new Map(proc.transitions.map((t) => [t.id, t]));
+  let cur = origin;
+  for (const step of path) {
+    assert.ok(step && typeof step.id === 'string' && step.id.length > 0, `每步必须引用录入的迁移标识：${JSON.stringify(step)}`);
+    const edge = byId.get(step.id);
+    assert.ok(edge, `迁移标识必须存在于录入规程：${step.id}`);
+    assert.equal(step.from, edge.from, '路径步骤须与录入迁移一致(from)');
+    assert.equal(step.to, edge.to, '路径步骤须与录入迁移一致(to)');
+    assert.equal(step.action, edge.action, '路径步骤须与录入迁移一致(action)');
+    assert.equal(step.from, cur, '静默前缀/动作必须逐步衔接，前一步终点须等于下一步起点');
+    cur = step.to;
+  }
+  assert.equal(cur, target, '挑战路径终点必须是挑战落点');
+  // 除最后一步外只能是静默 tau 前缀
+  for (const step of path.slice(0, -1)) assert.equal(step.action, TAU, '可观察动作之前只能有静默前缀');
+  assert.equal(path[path.length - 1].action, action, '最后一步必须是挑战动作');
+}
+
+test('不连通汇合：初始对第 2 轮淘汰，x 挑战路径从实际挑战状态连续回放且不引用不连通迁移', () => {
+  const r = audit(samples.converge.procA, samples.converge.procB);
+  assert.equal(r.ok, true);
+  assert.equal(r.equivalent, false);
+
+  const p00 = r.eliminatedPairs.find((p) => p.pair[0] === 'a0' && p.pair[1] === 'b0');
+  assert.ok(p00, '初始状态对应被淘汰');
+  assert.equal(p00.round, 2, '初始对在后续轮次（第 2 轮）淘汰');
+  assert.equal(p00.action, 'x');
+  assert.equal(p00.challenger, 'A');
+
+  const fail = p00.transitions.find((t) => t.source === 'a2');
+  assert.equal(fail.reason, 'ALL_RESPONSES_ELIMINATED');
+  // 连续路径：a0 --tau/t-tau--> am --x/t-x-relay--> a2
+  assertContinuousPath(samples.converge.procA, fail.challengePath, 'a0', 'x', 'a2');
+  const ids = fail.challengePath.map((s) => s.id);
+  assert.deepEqual(ids, ['t-tau', 't-x-relay']);
+  // 关键回归：绝不引用与初态不连通、但标识排序更靠前的同动作迁移
+  assert.ok(!ids.includes('aaa-direct'), '不得引用不连通状态 ad 上的直接 x 迁移');
+  assert.deepEqual(fail.challengePath.map((s) => s.from), ['a0', 'am']);
+
+  // 第 1 轮淘汰的是 (a2,b1)：B 侧 y 动作 A 侧无法承接
+  const p21 = r.eliminatedPairs.find((p) => p.pair[0] === 'a2' && p.pair[1] === 'b1');
+  assert.equal(p21.round, 1);
+  assert.equal(p21.action, 'y');
+  assert.equal(fail.responses[0].eliminatedRound, 1);
+});
+
+test('所有淘汰义务的挑战路径均从实际挑战状态连续到达落点，且不引用不可达迁移', () => {
+  const r = audit(samples.converge.procA, samples.converge.procB);
+  for (const ep of r.eliminatedPairs) {
+    const origin = ep.challenger === 'A' ? ep.pair[0] : ep.pair[1];
+    const proc = ep.challenger === 'A' ? samples.converge.procA : samples.converge.procB;
+    for (const t of ep.transitions) {
+      assertContinuousPath(proc, t.challengePath, origin, ep.action, t.source);
+    }
+  }
+});
+
+test('多个有效静默前缀汇合：挑战路径选择稳定（重排录入顺序不改变展示）', () => {
+  const mk = (order) => {
+    const taus = [
+      { id: 'p1', from: 's', action: 'tau', to: 'u1' },
+      { id: 'p2', from: 's', action: 'tau', to: 'u2' },
+    ];
+    const edges = [
+      { id: 'e1', from: 'u1', action: 'x', to: 'v' },
+      { id: 'e2', from: 'u2', action: 'x', to: 'v' },
+    ];
+    const all = order === 'forward' ? [...taus, ...edges] : [...taus.reverse(), ...edges.reverse()];
+    return {
+      states: [{ name: 's' }, { name: 'u1' }, { name: 'u2' }, { name: 'v' }],
+      initial: 's',
+      transitions: all,
+    };
+  };
+  const B = {
+    states: [{ name: 'q' }, { name: 'r' }],
+    initial: 'q',
+    transitions: [
+      { id: 'bx', from: 'q', action: 'x', to: 'r' },
+      { id: 'bz', from: 'r', action: 'z', to: 'r' },
+    ],
+  };
+  const pathOf = (spec) => {
+    const res = audit(spec, B);
+    const p00 = res.eliminatedPairs.find((p) => p.pair[0] === 's' && p.pair[1] === 'q');
+    const t = p00.transitions.find((x) => x.source === 'v');
+    return t.challengePath;
+  };
+  const p1 = pathOf(mk('forward'));
+  const p2 = pathOf(mk('reverse'));
+  assert.deepEqual(p1, p2, '存在多个有效静默前缀/汇合路径时展示顺序必须稳定');
+  assertContinuousPath(mk('forward'), p1, 's', 'x', 'v');
+  // u1 < u2，最短（1 条 tau）前缀中按状态名稳定选取 u1
+  assert.deepEqual(p1.map((s) => s.id), ['p1', 'e1']);
+});
+
 test('tau 链上的弱转移：静默前缀后承接动作', () => {
   const proc = normalize({
     states: [{ name: 's' }, { name: 'u' }, { name: 'p' }, { name: 'v' }],
